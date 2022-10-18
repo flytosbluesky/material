@@ -1,0 +1,578 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using VizReal.Common.Helpers;
+
+namespace VizReal.Framework.DataExchange
+{
+    /// <summary>
+    /// .obj文件读取类
+    /// </summary>
+    public class ReaderOBJ
+    {
+        #region Private definition
+
+        struct OBJFace
+        {
+            public string materialName;
+            public string meshName;
+            public int[] indexes;
+        }
+
+        bool split_by_material = false;
+        bool found_material_file;
+        string[] search_paths = new string[] { "", "%FileName%_Textures" + System.IO.Path.DirectorySeparatorChar };
+
+        readonly string VIZREAL_BASE = "vizreal_base";
+        float m_unit = 1000.0f;
+
+        int m_current_line = 0;
+        int m_total_line = 0;
+
+        #endregion
+
+        /// <summary>
+        /// .obj读取入口
+        /// </summary>
+        /// <param name="file"></param>
+        /// <param name="create_dummy_root"></param>
+        /// <param name="add_editor"></param>
+        /// <returns></returns>
+        public Node Import(string file, bool create_dummy_root = true, bool add_editor = true)
+        {
+            Node m_root = null;
+            if (!System.IO.File.Exists(file))
+            {
+                Log.error("ReaderOBJ.Import() obj file is not exist: {0}\n", file);
+                return m_root;
+            }
+
+            string ext = System.IO.Path.GetExtension(file).ToLower();
+            if (ext != ".obj")
+            {
+                Log.error("ReaderOBJ.Import() file is not .obj file: {0}\n", file);
+                return m_root;
+            }
+
+            m_total_line = get_obj_lines(file);
+
+            string mesh_name = System.IO.Path.GetFileNameWithoutExtension(file);
+            FileInfo fileInfo = new FileInfo(file);
+
+            string cmaterial = "";
+            string cmesh = "default";
+
+            List<string> mat_names = new List<string>();
+            List<string> obj_names = new List<string>();
+            Dictionary<string, int> hashtable = new Dictionary<string, int>();
+            List<OBJFace> faceList = new List<OBJFace>();
+
+            bool hasNormals = false;
+            // obj list
+            List<vec3> vertices = new List<vec3>();
+            List<vec3> normals = new List<vec3>();
+            List<vec2> uvs = new List<vec2>();
+            // mesh list
+            List<vec3> uvertices = new List<vec3>();
+            List<vec3> unormals = new List<vec3>();
+            List<vec2> uuvs = new List<vec2>();
+
+            using (FileStream fs = new FileStream(file, FileMode.Open, FileAccess.Read))
+            {
+                using (StreamReader sr = new StreamReader(fs))
+                {
+                    while (!sr.EndOfStream)
+                    {
+                        string line = sr.ReadLine();
+                        m_current_line++;
+
+                        if (line.Length > 0 && !line.StartsWith("#"))
+                        {
+                            string l = line.Trim().Replace("  ", " ");
+                            string[] cmps = l.Split(' ');
+                            string data = l.Remove(0, l.IndexOf(' ') + 1);
+
+                            if (cmps[0] == "mtllib")
+                            {
+                                string pth = get_file_path(data, fileInfo.Directory.FullName + System.IO.Path.DirectorySeparatorChar, mesh_name);
+                                if (pth != null)
+                                {
+                                    // has found material file
+                                    //load_mtl_file(pth);
+                                    //found_material_file = true;
+                                }
+                                else
+                                {
+                                    // no material file
+                                    found_material_file = false;
+                                }
+                            }
+                            else if ((cmps[0] == "g" || cmps[0] == "o") && !split_by_material)
+                            {
+                                cmesh = data;
+                                if (string.IsNullOrEmpty(cmesh)) continue;
+
+                                if (!obj_names.Contains(cmesh))
+                                {
+                                    obj_names.Add(cmesh);
+                                }
+                            }
+                            else if (cmps[0] == "usemtl")
+                            {
+                                cmaterial = data;
+                                if (!mat_names.Contains(cmaterial))
+                                {
+                                    mat_names.Add(cmaterial);
+                                }
+
+                                if (split_by_material)
+                                {
+                                    if (!obj_names.Contains(cmaterial))
+                                    {
+                                        obj_names.Add(cmaterial);
+                                    }
+                                }
+                            }
+                            else if (cmps[0] == "v")
+                            {
+                                vertices.Add(parse_vec3(cmps) / m_unit);
+                            }
+                            else if (cmps[0] == "vn")
+                            {
+                                normals.Add(parse_vec3(cmps));
+                            }
+                            else if (cmps[0] == "vt")
+                            {
+                                uvs.Add(parse_vec2(cmps));
+                            }
+                            else if (cmps[0] == "f")
+                            {
+                                int[] indexes = new int[cmps.Length - 1];
+                                for (int i = 1; i < cmps.Length; i++)
+                                {
+                                    string felement = cmps[i];
+                                    int vertexIndex = -1;
+                                    int normalIndex = -1;
+                                    int uvIndex = -1;
+
+                                    if (felement.Contains("//"))
+                                    {
+                                        // doubleslash, no UVS.
+                                        string[] elementComps = felement.Split('/');
+                                        vertexIndex = int.Parse(elementComps[0]) - 1;
+                                        normalIndex = int.Parse(elementComps[2]) - 1;
+                                    }
+                                    else if (felement.Count(x => x == '/') == 2)
+                                    {
+                                        // contains everything
+                                        string[] elementComps = felement.Split('/');
+                                        vertexIndex = int.Parse(elementComps[0]) - 1;
+                                        uvIndex = int.Parse(elementComps[1]) - 1;
+                                        normalIndex = int.Parse(elementComps[2]) - 1;
+                                    }
+                                    else if (!felement.Contains("/"))
+                                    {
+                                        // just vertex inedx
+                                        vertexIndex = int.Parse(felement) - 1;
+                                    }
+                                    else
+                                    {
+                                        // vertex and uv
+                                        string[] elementComps = felement.Split('/');
+                                        vertexIndex = int.Parse(elementComps[0]) - 1;
+                                        uvIndex = int.Parse(elementComps[1]) - 1;
+                                    }
+
+                                    string hashEntry = vertexIndex + "|" + normalIndex + "|" + uvIndex;
+                                    if (hashtable.ContainsKey(hashEntry))
+                                    {
+                                        indexes[i - 1] = hashtable[hashEntry];
+                                    }
+                                    else
+                                    {
+                                        // create a new hash entry
+                                        indexes[i - 1] = hashtable.Count;
+                                        hashtable[hashEntry] = hashtable.Count;
+                                        uvertices.Add(vertices[vertexIndex]);
+                                        if (normalIndex < 0 || (normalIndex > (normals.Count - 1)))
+                                        {
+                                            unormals.Add(vec3.ZERO);
+                                        }
+                                        else
+                                        {
+                                            hasNormals = true;
+                                            unormals.Add(normals[normalIndex]);
+                                        }
+                                        if (uvIndex < 0 || (uvIndex > (uvs.Count - 1)))
+                                        {
+                                            uuvs.Add(vec2.ZERO);
+                                        }
+                                        else
+                                        {
+                                            uuvs.Add(uvs[uvIndex]);
+                                        }
+                                    }
+                                }
+
+                                if (indexes.Length < 5 && indexes.Length >= 3)
+                                {
+                                    OBJFace f1 = new OBJFace
+                                    {
+                                        materialName = cmaterial,
+                                        indexes = new int[] { indexes[0], indexes[1], indexes[2] },
+                                        meshName = (split_by_material) ? cmaterial : cmesh
+                                    };
+                                    faceList.Add(f1);
+
+                                    if (indexes.Length > 3)
+                                    {
+                                        OBJFace f2 = new OBJFace
+                                        {
+                                            materialName = cmaterial,
+                                            meshName = (split_by_material) ? cmaterial : cmesh,
+                                            indexes = new int[] { indexes[2], indexes[3], indexes[0] }
+                                        };
+                                        faceList.Add(f2);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    sr.Close();
+                }
+                fs.Close();
+            }
+
+            if (obj_names.Count == 0)
+            {
+                obj_names.Add("default");
+            }
+
+            if (create_dummy_root)
+            {
+                m_root = new NodeDummy();
+                m_root.setWorldTransform(dmat4.IDENTITY);
+                m_root.setName(mesh_name);
+                m_root.release();
+            }
+
+            foreach (string obj in obj_names)
+            {
+                Mesh mesh = new Mesh();
+
+                // reordering list
+                List<vec3> processedVertices = new List<vec3>();
+                List<vec3> processedNormals = new List<vec3>();
+                List<vec2> processedUVs = new List<vec2>();
+                List<int[]> processedIndexes = new List<int[]>();
+                Dictionary<int, int> remapTable = new Dictionary<int, int>();
+                // mesh material pupulate
+                List<string> meshMaterialNames = new List<string>();
+
+                OBJFace[] ofaces = faceList.Where(x => x.meshName == obj).ToArray();
+                int sidx = 0;
+                int offset = 0;
+                int count = 0;
+
+                foreach (string mn in mat_names)
+                {
+                    OBJFace[] faces = ofaces.Where(x => x.materialName == mn).ToArray();
+                    if (faces.Length > 0)
+                    {
+                        int[] indexes = new int[0];
+                        foreach (OBJFace f in faces)
+                        {
+                            int l = indexes.Length;
+                            Array.Resize(ref indexes, l + f.indexes.Length);
+                            Array.Copy(f.indexes, 0, indexes, l, f.indexes.Length);
+                        }
+                        meshMaterialNames.Add(mn);
+
+                        int surface_idx = mesh.addSurface("surface_" + sidx++);
+                        offset = count;
+                        for (int i = 0; i < indexes.Length; i++)
+                        {
+                            int idx = indexes[i];
+                            // build remap table
+                            if (remapTable.ContainsKey(idx))
+                            {
+                                indexes[i] = remapTable[idx];
+                            }
+                            else
+                            {
+                                processedVertices.Add(uvertices[idx]);
+                                mesh.addVertex(uvertices[idx], surface_idx);
+
+                                processedNormals.Add(unormals[idx]);
+                                mesh.addNormal(unormals[idx], surface_idx);
+
+                                processedUVs.Add(uuvs[idx]);
+                                mesh.addTexCoord0(uuvs[idx], surface_idx);
+
+                                remapTable[idx] = processedVertices.Count - 1;
+                                indexes[i] = remapTable[idx];
+
+                                count++;
+                            }
+
+                            mesh.addIndex(offset != 0 ? indexes[i] % offset : indexes[i], surface_idx);
+                        }
+
+                        if (!hasNormals) mesh.createNormals(30.0f, surface_idx);
+                        mesh.createTangents(surface_idx);
+                        mesh.createBounds(surface_idx);
+                    }
+                }
+
+                string mesh_name_ext = string.Format("worlds/{0}/meshes/", mesh_name);
+                string mesh_dir = string.Format("{0}{1}", Engine.get().getSavePath(), mesh_name_ext);
+                DirHelper.CreateDirectory(mesh_dir);
+
+                //处理文件名称带非法字符
+                string obj2 = DirHelper.ToValidFileName(obj);
+                mesh.save(string.Format("{0}/{1}.mesh", mesh_dir, obj2));
+
+                ObjectMeshStatic meshStatic = new ObjectMeshStatic(mesh);
+                meshStatic.setMeshName(mesh_name_ext + obj2 + ".mesh");
+
+                meshStatic.setName(obj2);
+                meshStatic.setProperty("surface_base", "*");
+
+                if (create_dummy_root) meshStatic.setParent(m_root);
+                else
+                {
+                    m_root = meshStatic;
+                    m_root.setName(mesh_name);
+                }
+
+                if (found_material_file)
+                {
+                    int surface = 0;
+                    foreach (string mat in meshMaterialNames)
+                    {
+                        meshStatic.setMaterial(mat, surface++);
+                    }
+                }
+                else
+                {
+                    Log.message("ReaderOBJ.Import() obj material file not found, check the obj file\n");
+                    meshStatic.setMaterial(VIZREAL_BASE, "*");
+                }
+
+                mesh.release();
+                meshStatic.release();
+            }
+
+            if (add_editor)
+            {
+                Editor.get().addNode(m_root, 1);
+                World.get().addUpdateNode(m_root);
+                Editor.get().needReload();
+            }
+
+            return m_root;
+        }
+
+        #region Private
+
+        int get_obj_lines(string file)
+        {
+            int lines = 0;
+
+            // .obj文件行数
+            using (FileStream fs = new FileStream(file, FileMode.Open, FileAccess.Read))
+            {
+                using (StreamReader sr = new StreamReader(fs))
+                {
+                    while (!sr.EndOfStream)
+                    {
+                        sr.ReadLine();
+                        lines++;
+                    }
+                    sr.Close();
+                }
+                fs.Close();
+            }
+
+            // .mtl文件行数
+            string mtl = System.IO.Path.ChangeExtension(file, ".mtl");
+            using (FileStream fs = new FileStream(mtl, FileMode.Open, FileAccess.Read))
+            {
+                using (StreamReader sr = new StreamReader(fs))
+                {
+                    while (!sr.EndOfStream)
+                    {
+                        sr.ReadLine();
+                        lines++;
+                    }
+                    sr.Close();
+                }
+                fs.Close();
+            }
+
+            return lines;
+        }
+
+        string get_file_path(string path, string base_path, string file_name)
+        {
+            foreach (string sp in search_paths)
+            {
+                string s = sp.Replace("%FileName%", file_name);
+                if (System.IO.File.Exists(base_path + s + path))
+                {
+                    return base_path + s + path;
+                }
+                else if (System.IO.File.Exists(path))
+                {
+                    return path;
+                }
+            }
+
+            return null;
+        }
+
+        vec4 parse_color(string[] cmps, float scalar = 1.0f)
+        {
+            vec4 color = vec4.ONE;
+            color.x = float.Parse(cmps[1]) * scalar;
+            color.y = float.Parse(cmps[2]) * scalar;
+            color.z = float.Parse(cmps[3]) * scalar;
+            return color;
+        }
+
+        vec3 parse_vec3(string[] cmps)
+        {
+            float x = float.Parse(cmps[1]);
+            float y = float.Parse(cmps[2]);
+            float z = float.Parse(cmps[3]);
+            return new vec3(x, y, z);
+        }
+
+        vec2 parse_vec2(string[] cmps)
+        {
+            float x = float.Parse(cmps[1]);
+            float y = float.Parse(cmps[2]);
+            return new vec2(x, y);
+        }
+
+        void load_mtl_file(string file)
+        {
+            FileInfo fileInfo = new FileInfo(file);
+            string base_file_name = System.IO.Path.GetFileNameWithoutExtension(file);
+            string mtl_file_dir = fileInfo.Directory.FullName + System.IO.Path.DirectorySeparatorChar;
+            Material mat_base = Materials.get().findMaterial(VIZREAL_BASE);
+
+            // create material file
+            Material cur_mat = null;
+            string material_dir = string.Format("{0}worlds/{1}/materials", Engine.get().getSavePath(), base_file_name);
+            DirHelper.CreateDirectory(material_dir);
+
+            string mat_file = string.Format("{0}/{1}.mat", material_dir, base_file_name);
+            string mat_relative_file = string.Format("worlds/{0}/materials/{1}.mat", base_file_name, base_file_name);
+
+            if (!System.IO.File.Exists(mat_file))
+            {
+                Materials.get().create(mat_relative_file);
+            }
+            int lib = Materials.get().addWorldLibrary(mat_relative_file);
+
+            foreach (string ln in System.IO.File.ReadAllLines(file))
+            {
+                string l = ln.Trim().Replace("  ", " ");
+                string[] cmps = l.Split(' ');
+                string data = l.Remove(0, l.IndexOf(' ') + 1);
+
+                if (cmps[0] == "newmtl")
+                {
+                    Materials.get().cloneMaterial(VIZREAL_BASE, mat_relative_file, data);
+                    cur_mat = Materials.get().findMaterial(data);
+                }
+                else if (cmps[0] == "Kd")
+                {
+                    int idx = cur_mat.findParameter("diffuse_color");
+                    if (idx != -1)
+                    {
+                        cur_mat.setParameter(idx, parse_color(cmps));
+                    }
+                }
+                else if (cmps[0] == "map_Kd")
+                {
+                    // texture
+                    string fpth = get_file_path(data, mtl_file_dir, base_file_name);
+                    if (fpth != null)
+                    {
+                        int idx = cur_mat.findTexture("diffuse");
+                        if (idx != -1)
+                        {
+                            fpth = Projects.ProjectManager.GetPath(fpth);
+                            cur_mat.setImageTextureName(idx, fpth);
+                        }
+                    }
+                }
+                else if (cmps[0] == "map_Bump")
+                {
+                    // texture
+                    string fpth = get_file_path(data, mtl_file_dir, base_file_name);
+                    if (fpth != null)
+                    {
+                        int idx = cur_mat.findTexture("normal");
+                        if (idx != -1)
+                        {
+                            fpth = Projects.ProjectManager.GetPath(fpth);
+                            cur_mat.setImageTextureName(idx, fpth);
+                        }
+                    }
+                }
+                else if (cmps[0] == "Ks")
+                {
+                    int idx = cur_mat.findParameter("specular_color");
+                    if (idx != -1)
+                    {
+                        cur_mat.setParameter(idx, parse_color(cmps));
+                    }
+                }
+                else if (cmps[0] == "Ka")
+                {
+                    int idx = cur_mat.findParameter("emission_color");
+                    if (idx != -1)
+                    {
+                        cur_mat.setParameter(idx, parse_color(cmps));
+                    }
+                }
+                else if (cmps[0] == "d")
+                {
+                    float transparency = float.Parse(cmps[1]);
+                    if (transparency < 1)
+                    {
+                        int idx = cur_mat.findParameter("diffuse_color");
+                        if (idx != -1)
+                        {
+                            vec4 color = cur_mat.getParameter(idx);
+                            color.z = transparency;
+                            cur_mat.setBlendFunc(RenderState.BLEND_SRC_ALPHA, RenderState.BLEND_ONE_MINUS_SRC_ALPHA);
+                            cur_mat.setPostDeferred(true);
+                            cur_mat.setPostScattering(true);
+                            cur_mat.setParameter(idx, color);
+                        }
+                    }
+                }
+                else if (cmps[0] == "Ns")
+                {
+                    float Ns = float.Parse(cmps[1]);
+                    Ns = (Ns / m_unit);
+                    int idx = cur_mat.findParameter("specular_power");
+                    vec4 max_power = new vec4(4.0f);
+                    if (idx != -1)
+                    {
+                        cur_mat.setParameter(idx, MathLib.min(new vec4(Ns), max_power));
+                    }
+                }
+            }
+
+            Materials.get().save(mat_relative_file);
+        }
+    }
+
+    #endregion
+}
